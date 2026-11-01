@@ -1,5 +1,4 @@
-# Recorded audio and generated labels stay local unless deliberately shared.
-scripts/data/
+# Keep the source recording dataset in Git. Audio uses Git LFS.
 
 # Python and local environments.
 __pycache__/
