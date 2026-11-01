@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Keypad recording</title>
+  <style>
+    body { font: 16px system-ui, sans-serif; max-width: 680px; margin: 40px auto; padding: 0 20px; color: #17212b; }
+    h1 { margin-bottom: 6px; } p { line-height: 1.5; } .muted { color: #526273; }
+    .fields { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; margin: 24px 0; }
+    label { display: grid; gap: 5px; font-weight: 600; }
+    input { padding: 9px; font: inherit; border: 1px solid #aab5c0; border-radius: 6px; }
+    .card { border: 1px solid #b9c5cf; border-radius: 12px; padding: 24px; background: #f7fafc; }
+    .pin { font: 700 clamp(52px, 12vw, 88px) ui-monospace, monospace; letter-spacing: .14em; margin: 14px 0; }
+    .buttons { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 20px; }
+    button { padding: 11px 20px; border: 0; border-radius: 7px; background: #1158a7; color: white; font: 600 16px system-ui; cursor: pointer; }
+    button.secondary { color: #17212b; background: #dce4eb; }
+    button:disabled { opacity: .45; cursor: default; }
+    #status { min-height: 25px; margin-top: 16px; font-weight: 600; }
+    audio { margin-top: 14px; width: 100%; }
+    @media (max-width: 500px) { .fields { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <h1>Keypad recording</h1>
+  <p class="muted">Use a test keypad and dummy sequences. Keep the microphone and keypad in the same positions for each session.</p>
+  <div class="fields">
+    <label>Session ID <input id="session" required maxlength="40" pattern="[A-Za-z0-9_-]+"></label>
+    <label>Keypad ID <input id="keypad" required maxlength="40" pattern="[A-Za-z0-9_-]+" value="keypad1"></label>
+    <label>Microphone distance (cm) <input id="distance" required type="number" min="1" max="999" value="20"></label>
+  </div>
+  <div class="card">
+    <div id="progress">Loading plan...</div>
+    <div id="pin" class="pin">----</div>
+    <div class="buttons">
+      <button id="start">Start recording</button>
+      <button id="stop" disabled>Stop</button>
+      <button id="save" disabled>Save take</button>
+      <button id="retry" class="secondary" disabled>Retry</button>
+    </div>
+    <div id="status" role="status"></div>
+    <audio id="playback" controls hidden></audio>
+  </div>
+  <p class="muted">Press Start, wait for “Recording,” enter the four digits, then press Stop. Listen before saving. Retry discards the take.</p>
+  <script>
+    const $ = id => document.getElementById(id);
+    const fields = ['session', 'keypad', 'distance'];
+    const status = message => { $('status').textContent = message; };
+    let trial = null, context = null, stream = null, source = null, worklet = null;
+    let chunks = [], sampleRate = 0, wavBlob = null, playbackUrl = null;
+
+    const today = new Date();
+    $('session').value = [today.getFullYear(), String(today.getMonth() + 1).padStart(2, '0'),
+      String(today.getDate()).padStart(2, '0')].join('-') + '-a';
+    for (const id of ['session', 'keypad']) {
+      const remembered = localStorage.getItem('keypad-' + id);
+      if (remembered) $(id).value = remembered;
+      $(id).addEventListener('change', () => localStorage.setItem('keypad-' + id, $(id).value));
+    }
+
+    async function refresh() {
+      const response = await fetch('/api/state');
+      const state = await response.json();
+      trial = state.next;
+      $('progress').textContent = `${state.completed} of ${state.total} recordings saved` + (trial ? ` · ${trial.trial_id}` : ' · plan complete');
+      $('pin').textContent = trial ? trial.pin : 'Done';
+      $('start').disabled = !trial;
+      if (!trial) status('All planned recordings are saved.');
+    }
+
+    function validFields() {
+      return fields.every(id => $(id).reportValidity());
+    }
+
+    function encodeWav(parts, rate) {
+      const length = parts.reduce((sum, part) => sum + part.length, 0);
+      const buffer = new ArrayBuffer(44 + length * 2);
+      const view = new DataView(buffer);
+      const ascii = (offset, value) => { for (let i = 0; i < value.length; i++) view.setUint8(offset + i, value.charCodeAt(i)); };
+      ascii(0, 'RIFF'); view.setUint32(4, 36 + length * 2, true); ascii(8, 'WAVE');
+      ascii(12, 'fmt '); view.setUint32(16, 16, true); view.setUint16(20, 1, true);
+      view.setUint16(22, 1, true); view.setUint32(24, rate, true);
+      view.setUint32(28, rate * 2, true); view.setUint16(32, 2, true);
+      view.setUint16(34, 16, true); ascii(36, 'data'); view.setUint32(40, length * 2, true);
+      let offset = 44;
+      for (const part of parts) for (const value of part) {
+        const sample = Math.max(-1, Math.min(1, value));
+        view.setInt16(offset, sample < 0 ? sample * 32768 : sample * 32767, true);
+        offset += 2;
+      }
+      return new Blob([buffer], { type: 'audio/wav' });
+    }
+
+    function discard() {
+      wavBlob = null; chunks = [];
+      if (playbackUrl) URL.revokeObjectURL(playbackUrl);
+      playbackUrl = null; $('playback').hidden = true; $('playback').removeAttribute('src');
+      $('save').disabled = true; $('retry').disabled = true; $('start').disabled = !trial;
+    }
+
+    $('start').onclick = async () => {
+      if (!trial || !validFields()) return;
+      discard(); $('start').disabled = true; status('Connecting microphone...');
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: {
+          channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false
+        }});
+        context = new AudioContext();
+        await context.audioWorklet.addModule('/recorder-worklet.js');
+        sampleRate = context.sampleRate;
+        worklet = new AudioWorkletNode(context, 'recorder-processor');
+        worklet.port.onmessage = event => chunks.push(event.data);
+        source = context.createMediaStreamSource(stream);
+        source.connect(worklet); worklet.connect(context.destination);
+        await context.resume();
+        $('stop').disabled = false; status('Recording — enter ' + trial.pin + ' now.');
+      } catch (error) {
+        if (stream) stream.getTracks().forEach(track => track.stop());
+        if (context) await context.close();
+        stream = null; context = null; $('start').disabled = false;
+        status('Microphone error: ' + error.message);
+      }
+    };
+
+    $('stop').onclick = async () => {
+      $('stop').disabled = true;
+      source.disconnect(); worklet.disconnect();
+      stream.getTracks().forEach(track => track.stop());
+      await context.close();
+      stream = null; context = null;
+      wavBlob = encodeWav(chunks, sampleRate); chunks = [];
+      playbackUrl = URL.createObjectURL(wavBlob);
+      $('playback').src = playbackUrl; $('playback').hidden = false;
+      $('save').disabled = false; $('retry').disabled = false;
+      status('Take ready — play it, then Save or Retry.');
+    };
+
+    $('retry').onclick = () => { discard(); status('Take discarded. Ready to record the same PIN.'); };
+
+    $('save').onclick = async () => {
+      if (!wavBlob || !validFields()) return;
+      $('save').disabled = true; status('Saving...');
+      const headers = { 'Content-Type': 'audio/wav', 'X-Trial-Id': trial.trial_id,
+        'X-Session-Id': $('session').value, 'X-Keypad-Id': $('keypad').value,
+        'X-Distance-Cm': $('distance').value };
+      try {
+        const response = await fetch('/api/record', { method: 'POST', headers, body: wavBlob });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || 'Save failed');
+        discard(); await refresh();
+        if (trial) status('Saved. Ready for the next PIN.');
+      } catch (error) {
+        $('save').disabled = false; status('Save failed: ' + error.message);
+      }
+    };
+
+    refresh().catch(error => status('Could not load plan: ' + error.message));
+  </script>
+</body>
+</html>

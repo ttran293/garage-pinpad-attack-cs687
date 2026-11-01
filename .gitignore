@@ -1,0 +1,12 @@
+# Recorded audio and generated labels stay local unless deliberately shared.
+scripts/data/
+
+# Python and local environments.
+__pycache__/
+*.py[cod]
+.venv/
+
+# Future model outputs.
+project/checkpoints/
+project/runs/
+project/data/
