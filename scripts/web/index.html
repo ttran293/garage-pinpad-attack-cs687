@@ -118,7 +118,10 @@
         if (stream) stream.getTracks().forEach(track => track.stop());
         if (context) await context.close();
         stream = null; context = null; $('start').disabled = false;
-        status('Microphone error: ' + error.message);
+        const blocked = error.name === 'NotAllowedError' || /permission denied/i.test(error.message);
+        status(blocked
+          ? 'Microphone access was blocked. Open http://localhost:8765/ directly in Chrome or Edge and allow microphone access for this site. If it still fails, check Windows Settings > Privacy & security > Microphone, then enable Microphone access and Let desktop apps access your microphone.'
+          : 'Microphone error: ' + error.message);
       }
     };
 

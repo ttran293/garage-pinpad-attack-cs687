@@ -17,6 +17,8 @@ The plan, manifest, and saved WAV recordings are part of this Git repository. WA
 
 Use a microphone that can stay fixed relative to the keypad. Keep the keypad detached from any garage controller and use only dummy PINs. For a new session, change the Session ID before recording. Record a few trials and inspect the audio before completing the pilot.
 
+If the browser reports that microphone permission was denied by the system, open `http://localhost:8765/` directly in Chrome or Edge rather than an embedded browser. Allow microphone access for the site. In Windows, check Settings > Privacy & security > Microphone and enable Microphone access and Let desktop apps access your microphone. Reload the page and try Start recording again.
+
 Run `python scripts/record.py audit` to see progress, digit balance, and basic quiet/clipping flags. The flags do not replace listening to a sample of recordings. Do not run `init` again on an existing dataset; it preserves existing recordings and refuses to overwrite the plan.
 
 The first pilot plan is balanced by digit position. It contains 50 unique four-digit strings. A larger dataset plan should be created after reviewing the pilot, without overwriting its files.
