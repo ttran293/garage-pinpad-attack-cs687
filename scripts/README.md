@@ -2,14 +2,18 @@
 
 This is a local recording tool for a controlled keypad experiment. Use test sequences, not an active access code.
 
-## Start a 50-sequence pilot
+## Continue recording the expanded plan
 
 From the `cs687-padpadtatck` folder, run:
 
 ```powershell
-python scripts/record.py init --count 50
 python scripts/record.py serve
 ```
+
+The first 50 trials are complete. The plan now contains 250 trials, and the app
+continues at T0051. The next 200 trials are arranged in four balanced groups of
+50. You can stop and resume between groups; the app always picks the next
+unsaved trial. Change the Session ID when starting a new recording session.
 
 Open `http://localhost:8765/` on the same computer. The browser asks for microphone access. Enter the session and keypad IDs; the microphone distance defaults to 20 cm. For each prompted PIN, record one complete entry, listen to it, then Save or Retry. The browser creates mono 16-bit PCM WAV files. The app stores them in `scripts/data/audio/` and labels in `scripts/data/manifest.csv`. Restarting the server resumes at the next unsaved trial.
 
@@ -21,4 +25,5 @@ If the browser reports that microphone permission was denied by the system, open
 
 Run `python scripts/record.py audit` to see progress, digit balance, and basic quiet/clipping flags. The flags do not replace listening to a sample of recordings. Do not run `init` again on an existing dataset; it preserves existing recordings and refuses to overwrite the plan.
 
-The first pilot plan is balanced by digit position. It contains 50 unique four-digit strings. A larger dataset plan should be created after reviewing the pilot, without overwriting its files.
+The full plan has 250 unique four-digit strings. Every group of 50 is balanced
+by digit position: each digit appears five times in each position per group.
