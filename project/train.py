@@ -1,4 +1,4 @@
-"""Split the recordings, train the CNN on the GPU, and save its weights."""
+"""Train a CNN or CoAtNet on mel-spectrograms and compare predictions."""
 
 import argparse
 import math
@@ -12,10 +12,10 @@ from torch.utils.data import DataLoader, TensorDataset
 
 if __package__:
     from .audio import process_recording, read_manifest
-    from .model import KeypadCNN
+    from .model import KeypadCNN, KeypadCoAtNet
 else:
     from audio import process_recording, read_manifest
-    from model import KeypadCNN
+    from model import KeypadCNN, KeypadCoAtNet
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -53,7 +53,7 @@ def prepare_training_data(train_rows):
     return image_tensor, label_tensor
 
 
-def train_model(train_rows, epochs, seed):
+def train_model(train_rows, epochs, seed, model_name):
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is unavailable. Use the project .venv.")
     if epochs < 1:
@@ -73,10 +73,17 @@ def train_model(train_rows, epochs, seed):
     images = (images - mean) / standard_deviation
 
     dataset = TensorDataset(images, labels)
-    loader = DataLoader(dataset, batch_size=16, shuffle=True)
+    loader = DataLoader(dataset, batch_size=16, shuffle=True,
+                        generator=torch.Generator().manual_seed(seed))
 
-    model = KeypadCNN().to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    if model_name == "cnn":
+        model = KeypadCNN().to(device)
+        learning_rate = 0.001
+    else:
+        model = KeypadCoAtNet().to(device)
+        learning_rate = 0.0005
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     loss_function = nn.CrossEntropyLoss()
 
     for epoch in range(epochs):
@@ -102,10 +109,37 @@ def train_model(train_rows, epochs, seed):
     return model, mean, standard_deviation
 
 
-def save_model(model, mean, standard_deviation, train_rows, test_rows, epochs, seed):
+def evaluate_model(model, rows, mean, standard_deviation):
+    images, labels = prepare_training_data(rows)
+    images = (images - mean) / standard_deviation
+    loader = DataLoader(TensorDataset(images, labels), batch_size=16)
+
+    model.eval()
+    predicted_digits = []
+    with torch.no_grad():
+        for batch_images, _ in loader:
+            predictions = model(batch_images.to("cuda:0"))
+            predicted_digits.extend(predictions.argmax(dim=1).cpu().tolist())
+
+    correct_digits = 0
+    correct_pins = 0
+    true_digits = labels.tolist()
+    for position in range(len(true_digits)):
+        if predicted_digits[position] == true_digits[position]:
+            correct_digits += 1
+
+    for position in range(0, len(true_digits), 4):
+        if predicted_digits[position:position + 4] == true_digits[position:position + 4]:
+            correct_pins += 1
+
+    return correct_digits, len(true_digits), correct_pins, len(rows)
+
+
+def save_model(model, model_name, mean, standard_deviation,
+               train_rows, test_rows, epochs, seed):
     model_dir = PROJECT_DIR / "models"
     model_dir.mkdir(exist_ok=True)
-    filename = "keypad_cnn_mel_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".pt"
+    filename = "keypad_" + model_name + "_mel_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".pt"
     model_path = model_dir / filename
 
     train_ids = []
@@ -120,6 +154,7 @@ def save_model(model, mean, standard_deviation, train_rows, test_rows, epochs, s
     model = model.to("cpu")
     checkpoint = {
         "model_state": model.state_dict(),
+        "model_type": model_name,
         "spectrogram_type": "mel",
         "mean": mean,
         "standard_deviation": standard_deviation,
@@ -137,6 +172,7 @@ def main():
     parser.add_argument("--inspect", action="store_true", help="Only show detected press times")
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--seed", type=int, default=RANDOM_SEED)
+    parser.add_argument("--model", choices=["cnn", "coatnet", "both"], default="coatnet")
     args = parser.parse_args()
 
     rows = read_manifest()
@@ -155,11 +191,21 @@ def main():
     print("Training recordings:", len(train_rows))
     print("Test recordings:", len(test_rows))
 
-    model, mean, standard_deviation = train_model(train_rows, args.epochs, args.seed)
-    model_path = save_model(model, mean, standard_deviation,
-                            train_rows, test_rows, args.epochs, args.seed)
     print("GPU:", torch.cuda.get_device_name(0))
-    print("Model saved:", model_path)
+
+    model_names = ["cnn", "coatnet"] if args.model == "both" else [args.model]
+    for model_name in model_names:
+        print("\nTraining:", model_name)
+        model, mean, standard_deviation = train_model(
+            train_rows, args.epochs, args.seed, model_name)
+        train_result = evaluate_model(model, train_rows, mean, standard_deviation)
+        test_result = evaluate_model(model, test_rows, mean, standard_deviation)
+        model_path = save_model(model, model_name, mean, standard_deviation,
+                                train_rows, test_rows, args.epochs, args.seed)
+
+        print("Training digits: {}/{}; complete PINs: {}/{}".format(*train_result))
+        print("Test digits: {}/{}; complete PINs: {}/{}".format(*test_result))
+        print("Model saved:", model_path)
 
 
 if __name__ == "__main__":
