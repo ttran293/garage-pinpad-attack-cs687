@@ -13,8 +13,8 @@ from project.audio import (
     SECONDS_BEFORE_PRESS,
     detect_presses,
     make_clip,
-    make_spectrogram,
 )
+from project.mel_spectrogram import make_mel_spectrogram, MEL_BANDS
 
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
@@ -37,12 +37,11 @@ def draw_clip(wave_ax, spectrogram_ax, audio, start_time):
     wave_ax.set_ylabel("Amplitude")
     wave_ax.set_xlim(start_time, end_time)
 
-    image = make_spectrogram(audio)[0].numpy()
+    image = make_mel_spectrogram(audio)[0].numpy()
     spectrogram_ax.imshow(image, origin="lower", aspect="auto", cmap="magma",
-                          extent=(start_time, end_time, 0, SAMPLE_RATE / 2),
+                          extent=(start_time, end_time, 0, MEL_BANDS),
                           vmin=-7, vmax=2)
-    spectrogram_ax.set_ylim(0, 12000)
-    spectrogram_ax.set_ylabel("Frequency (Hz)")
+    spectrogram_ax.set_ylabel("Mel band")
     spectrogram_ax.set_xlabel("Time (seconds)")
 
 

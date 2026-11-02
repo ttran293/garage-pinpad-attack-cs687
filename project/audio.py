@@ -1,4 +1,4 @@
-"""Read keypad recordings and turn each press into a spectrogram."""
+"""Read keypad recordings and turn each press into a mel-spectrogram."""
 
 import csv
 import math
@@ -9,12 +9,15 @@ import soundfile as sf
 import torch
 from scipy.signal import find_peaks, resample_poly
 
+if __package__:
+    from .mel_spectrogram import make_mel_spectrogram
+else:
+    from mel_spectrogram import make_mel_spectrogram
+
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "scripts" / "data"
 SAMPLE_RATE = 48000
 FRAME_SIZE = 480             # 10 milliseconds of audio
-FFT_SIZE = 512
-HOP_SIZE = 128
 SECONDS_BEFORE_PRESS = 0.10
 SECONDS_AFTER_PRESS = 0.14
 
@@ -123,20 +126,6 @@ def make_clip(audio, press_time):
     return clip
 
 
-def make_spectrogram(clip):
-    waveform = torch.from_numpy(clip)
-    window = torch.hann_window(FFT_SIZE)
-    spectrum = torch.stft(
-        waveform,
-        n_fft=FFT_SIZE,
-        hop_length=HOP_SIZE,
-        window=window,
-        return_complex=True,
-    )
-    power = spectrum.abs().square()
-    return torch.log10(power + 0.00000001).unsqueeze(0)
-
-
 def process_recording(row):
     audio_path = DATA_DIR / row["audio_path"]
     audio = read_audio(audio_path)
@@ -145,6 +134,6 @@ def process_recording(row):
     images = []
     for press_time in press_times:
         clip = make_clip(audio, press_time)
-        images.append(make_spectrogram(clip))
+        images.append(make_mel_spectrogram(clip))
 
     return torch.stack(images), press_times

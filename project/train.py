@@ -10,8 +10,12 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from audio import process_recording, read_manifest
-from model import KeypadCNN
+if __package__:
+    from .audio import process_recording, read_manifest
+    from .model import KeypadCNN
+else:
+    from audio import process_recording, read_manifest
+    from model import KeypadCNN
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -101,7 +105,7 @@ def train_model(train_rows, epochs, seed):
 def save_model(model, mean, standard_deviation, train_rows, test_rows, epochs, seed):
     model_dir = PROJECT_DIR / "models"
     model_dir.mkdir(exist_ok=True)
-    filename = "keypad_cnn_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".pt"
+    filename = "keypad_cnn_mel_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".pt"
     model_path = model_dir / filename
 
     train_ids = []
@@ -116,6 +120,7 @@ def save_model(model, mean, standard_deviation, train_rows, test_rows, epochs, s
     model = model.to("cpu")
     checkpoint = {
         "model_state": model.state_dict(),
+        "spectrogram_type": "mel",
         "mean": mean,
         "standard_deviation": standard_deviation,
         "epochs": epochs,
