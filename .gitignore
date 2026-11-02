@@ -8,4 +8,6 @@ __pycache__/
 # Future model outputs.
 project/checkpoints/
 project/runs/
+project/models/
 project/data/
+project/tests/
