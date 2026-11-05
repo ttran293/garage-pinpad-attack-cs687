@@ -33,15 +33,16 @@
     <div id="progress">Loading plan...</div>
     <div id="pin" class="pin">----</div>
     <div class="buttons">
-      <button id="start">Start recording</button>
-      <button id="stop" disabled>Stop</button>
-      <button id="save" disabled>Save take</button>
-      <button id="retry" class="secondary" disabled>Retry</button>
+      <button id="start" aria-keyshortcuts="q">Start recording (Q)</button>
+      <button id="stop" aria-keyshortcuts="w" disabled>Stop (W)</button>
+      <button id="save" aria-keyshortcuts="e" disabled>Save take (E)</button>
+      <button id="retry" aria-keyshortcuts="r" class="secondary" disabled>Retry (R)</button>
     </div>
     <div id="status" role="status"></div>
     <audio id="playback" controls hidden></audio>
   </div>
   <p class="muted">Press Start, wait for “Recording,” enter the four digits, then press Stop. Listen before saving. Retry discards the take.</p>
+  <p class="muted">Keyboard shortcuts: Q starts, W stops, E saves, R retries. Shortcuts are inactive while editing a field.</p>
   <script>
     const $ = id => document.getElementById(id);
     const fields = ['session', 'keypad', 'distance'];
@@ -156,6 +157,18 @@
         $('save').disabled = false; status('Save failed: ' + error.message);
       }
     };
+
+    const shortcuts = { q: 'start', w: 'stop', e: 'save', r: 'retry' };
+    document.addEventListener('keydown', event => {
+      if (event.repeat || event.isComposing || event.ctrlKey || event.altKey || event.metaKey) return;
+      const target = event.target;
+      if (target instanceof Element &&
+          (target.closest('input, textarea, select') || target.isContentEditable)) return;
+      const id = shortcuts[event.key.toLowerCase()];
+      if (!id || $(id).disabled) return;
+      event.preventDefault();
+      $(id).click();
+    });
 
     refresh().catch(error => status('Could not load plan: ' + error.message));
   </script>
