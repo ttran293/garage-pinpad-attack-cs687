@@ -126,14 +126,12 @@ def make_clip(audio, press_time):
     return clip
 
 
-def process_recording(row):
-    audio_path = DATA_DIR / row["audio_path"]
+def recording_spectrograms(audio_path):
     audio = read_audio(audio_path)
     press_times = detect_presses(audio)
-
-    images = []
-    for press_time in press_times:
-        clip = make_clip(audio, press_time)
-        images.append(make_mel_spectrogram(clip))
-
+    images = [make_mel_spectrogram(make_clip(audio, time)) for time in press_times]
     return torch.stack(images), press_times
+
+
+def process_recording(row):
+    return recording_spectrograms(DATA_DIR / row["audio_path"])
