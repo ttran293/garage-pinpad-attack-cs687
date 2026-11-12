@@ -40,3 +40,20 @@ class KeypadCoAtNet(nn.Module):
         # Each press produces a 64-band mel-spectrogram. CoAtNet uses 64x64 images.
         images = F.interpolate(images, size=(64, 64), mode="bilinear", align_corners=False)
         return self.network(images)
+
+
+class KeypadGRU(nn.Module):
+    def __init__(self, feature_count):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(feature_count, 128),
+            nn.LayerNorm(128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+        )
+        self.context = nn.GRU(128, 64, batch_first=True, bidirectional=True)
+        self.output = nn.Linear(128, 10)
+
+    def forward(self, features):
+        context, _ = self.context(self.encoder(features))
+        return self.output(context)
