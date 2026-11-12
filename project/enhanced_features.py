@@ -17,6 +17,7 @@ ATTACK_BANDS = ((0, 1000), (1000, 2400), (2400, 3100),
                 (3100, 4800), (4800, 6000), (6000, 12000))
 HARMONIC_LOWPASS = butter(3, 300, fs=SAMPLE_RATE, output="sos")
 HARMONIC_BLOCKS = (651, 161, 161)
+HARMONIC_FEATURE_SET = "baseline_h12_relative"
 
 
 def window(audio, center, before, after):
