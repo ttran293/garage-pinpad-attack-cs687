@@ -1,6 +1,13 @@
+import timm
+from sklearn.pipeline import make_pipeline
+from sklearn.svm import SVC
 from torch import nn
 from torch.nn import functional as F
-import timm
+
+if __package__:
+    from .enhanced_features import BlockScaler, HARMONIC_BLOCKS
+else:
+    from enhanced_features import BlockScaler, HARMONIC_BLOCKS
 
 
 class KeypadCNN(nn.Module):
@@ -57,3 +64,7 @@ class KeypadGRU(nn.Module):
     def forward(self, features):
         context, _ = self.context(self.encoder(features))
         return self.output(context)
+
+
+def make_keypad_svm():
+    return make_pipeline(BlockScaler(HARMONIC_BLOCKS), SVC(C=10, kernel="rbf", gamma="scale"))

@@ -3,6 +3,8 @@
 import numpy as np
 import torch
 from scipy.signal import butter, sosfiltfilt, stft, welch
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.preprocessing import StandardScaler
 from torch.nn import functional as F
 
 if __package__:
@@ -14,6 +16,7 @@ else:
 ATTACK_BANDS = ((0, 1000), (1000, 2400), (2400, 3100),
                 (3100, 4800), (4800, 6000), (6000, 12000))
 HARMONIC_LOWPASS = butter(3, 300, fs=SAMPLE_RATE, output="sos")
+HARMONIC_BLOCKS = (651, 161, 161)
 
 
 def window(audio, center, before, after):
@@ -131,3 +134,20 @@ def recording_features(path, *, harmonics=False):
     harmonic = np.stack([first_two_harmonics(window(audio, onset, 0.030, 0.130)) for onset in onsets])
     relative = harmonic - harmonic.mean(axis=0)
     return np.concatenate([summary, harmonic, relative], axis=1)
+
+
+class BlockScaler(BaseEstimator, TransformerMixin):
+    """The archived SVM checkpoint loads this class by name."""
+
+    def __init__(self, blocks):
+        self.blocks = blocks
+
+    def fit(self, x, y=None):
+        if sum(self.blocks) != x.shape[1]:
+            raise ValueError("Feature block sizes do not match input.")
+        self.scaler_ = StandardScaler().fit(x)
+        self.weights_ = np.repeat(1 / np.sqrt(self.blocks), self.blocks)
+        return self
+
+    def transform(self, x):
+        return self.scaler_.transform(x) * self.weights_
