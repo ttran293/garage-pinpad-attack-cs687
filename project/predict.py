@@ -2,30 +2,53 @@
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
+import joblib
 import torch
 
 if __package__:
+    from . import enhanced_features
     from .audio import recording_spectrograms
-    from .enhanced_features import recording_features
     from .model import KeypadCNN, KeypadCoAtNet, KeypadGRU
 else:
+    import enhanced_features
     from audio import recording_spectrograms
-    from enhanced_features import recording_features
     from model import KeypadCNN, KeypadCoAtNet, KeypadGRU
 
 
 SPECTROGRAM_MODELS = {"cnn": KeypadCNN, "coatnet": KeypadCoAtNet}
 
 
+def predict_svm(checkpoint, wav):
+    # Joblib records the scaler's import path from the training command.
+    if __package__:
+        sys.modules.setdefault("enhanced_features", enhanced_features)
+    else:
+        root = str(Path(__file__).resolve().parents[1])
+        if root not in sys.path:
+            sys.path.append(root)
+
+    saved = joblib.load(checkpoint)
+    if saved.get("feature_set") != enhanced_features.HARMONIC_FEATURE_SET:
+        raise ValueError("Expected a harmonic SVM checkpoint.")
+
+    features = enhanced_features.recording_features(wav, harmonics=True)
+    digits = saved["classifier"].predict(features)
+    return "".join(map(str, digits))
+
+
 @torch.inference_mode()
 def predict(checkpoint, wav):
+    if checkpoint.suffix.lower() == ".joblib":
+        return predict_svm(checkpoint, wav)
+
     saved = torch.load(checkpoint, map_location="cpu", weights_only=True)
     model_type = saved.get("model_type")
     if model_type == "gru":
         model = KeypadGRU(saved["features"])
-        features = torch.from_numpy(recording_features(wav)).unsqueeze(0)
+        features = torch.from_numpy(enhanced_features.recording_features(wav)).unsqueeze(0)
     elif model_type in SPECTROGRAM_MODELS:
         if saved.get("spectrogram_type") != "mel":
             raise ValueError("Expected a mel-spectrogram checkpoint.")
