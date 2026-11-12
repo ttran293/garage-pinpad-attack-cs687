@@ -1,4 +1,4 @@
-"""Train a CNN or CoAtNet on mel-spectrograms and compare predictions."""
+"""Train a keypad model and score it on held-out recordings."""
 
 import argparse
 import math
@@ -11,11 +11,13 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 if __package__:
-    from .audio import process_recording, read_manifest
-    from .model import KeypadCNN, KeypadCoAtNet
+    from .audio import DATA_DIR, process_recording, read_manifest
+    from .enhanced_features import recording_features
+    from .model import KeypadCNN, KeypadCoAtNet, KeypadGRU
 else:
-    from audio import process_recording, read_manifest
-    from model import KeypadCNN, KeypadCoAtNet
+    from audio import DATA_DIR, process_recording, read_manifest
+    from enhanced_features import recording_features
+    from model import KeypadCNN, KeypadCoAtNet, KeypadGRU
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -37,67 +39,71 @@ def split_recordings(rows, seed=RANDOM_SEED):
     return train_rows, test_rows
 
 
-def prepare_training_data(train_rows):
-    images = []
+def prepare_training_data(rows, *, acoustic=False):
+    features = []
     labels = []
-
-    for row in train_rows:
-        recording_images, _ = process_recording(row)
-
-        for position in range(4):
-            images.append(recording_images[position])
-            labels.append(int(row["pin"][position]))
-
-    image_tensor = torch.stack(images)
-    label_tensor = torch.tensor(labels, dtype=torch.long)
-    return image_tensor, label_tensor
+    for row in rows:
+        if acoustic:
+            recording = torch.from_numpy(recording_features(DATA_DIR / row["audio_path"]))
+        else:
+            recording, _ = process_recording(row)
+        features.append(recording)
+        labels.append([int(digit) for digit in row["pin"]])
+    features = torch.stack(features)
+    labels = torch.tensor(labels, dtype=torch.long)
+    if acoustic:
+        return features, labels
+    return features.flatten(0, 1), labels.flatten()
 
 
 def train_model(train_rows, epochs, seed, model_name):
-    if not torch.cuda.is_available():
+    is_gru = model_name == "gru"
+    cuda_available = torch.cuda.is_available()
+    if not cuda_available and not is_gru:
         raise RuntimeError("CUDA is unavailable. Use the project .venv.")
     if epochs < 1:
         raise ValueError("Epochs must be at least 1.")
 
     torch.manual_seed(seed)
-    device = torch.device("cuda:0")
+    device = torch.device("cuda:0" if cuda_available else "cpu")
 
-    images, labels = prepare_training_data(train_rows)
-    missing_digits = set(range(10)) - set(labels.tolist())
+    features, labels = prepare_training_data(train_rows, acoustic=is_gru)
+    missing_digits = set(range(10)) - set(labels.flatten().tolist())
     if missing_digits:
         raise ValueError("Training recordings have no examples of: " + str(sorted(missing_digits)))
 
-    # Use only training recordings to calculate normalization values.
-    mean = images.mean()
-    standard_deviation = images.std().clamp_min(0.000001)
-    images = (images - mean) / standard_deviation
+    if is_gru:
+        mean = features.mean(dim=(0, 1), keepdim=True)
+        standard_deviation = features.std(dim=(0, 1), correction=0, keepdim=True).clamp_min(0.1)
+        model = KeypadGRU(features.shape[-1]).to(device)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
+    else:
+        mean = features.mean()
+        standard_deviation = features.std().clamp_min(0.000001)
+        if model_name == "cnn":
+            model = KeypadCNN().to(device)
+            learning_rate = 0.001
+        else:
+            model = KeypadCoAtNet().to(device)
+            learning_rate = 0.0005
+        optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
-    dataset = TensorDataset(images, labels)
+    dataset = TensorDataset((features - mean) / standard_deviation, labels)
     loader = DataLoader(dataset, batch_size=16, shuffle=True,
                         generator=torch.Generator().manual_seed(seed))
-
-    if model_name == "cnn":
-        model = KeypadCNN().to(device)
-        learning_rate = 0.001
-    else:
-        model = KeypadCoAtNet().to(device)
-        learning_rate = 0.0005
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     loss_function = nn.CrossEntropyLoss()
 
     for epoch in range(epochs):
         model.train()
         total_loss = 0
 
-        for batch_images, batch_labels in loader:
-            batch_images = batch_images.to(device)
-            batch_labels = batch_labels.to(device)
-
+        for batch_features, batch_labels in loader:
             optimizer.zero_grad()
-            predictions = model(batch_images)
-            loss = loss_function(predictions, batch_labels)
+            logits = model(batch_features.to(device)).reshape(-1, 10)
+            loss = loss_function(logits, batch_labels.to(device).flatten())
             loss.backward()
+            if is_gru:
+                nn.utils.clip_grad_norm_(model.parameters(), 2.0)
             optimizer.step()
 
             total_loss += loss.item()
@@ -110,59 +116,49 @@ def train_model(train_rows, epochs, seed, model_name):
 
 
 def evaluate_model(model, rows, mean, standard_deviation):
-    images, labels = prepare_training_data(rows)
-    images = (images - mean) / standard_deviation
-    loader = DataLoader(TensorDataset(images, labels), batch_size=16)
+    features, labels = prepare_training_data(rows, acoustic=isinstance(model, KeypadGRU))
+    features = (features - mean) / standard_deviation
+    loader = DataLoader(TensorDataset(features), batch_size=16)
+    device = next(model.parameters()).device
 
     model.eval()
     predicted_digits = []
     with torch.no_grad():
-        for batch_images, _ in loader:
-            predictions = model(batch_images.to("cuda:0"))
-            predicted_digits.extend(predictions.argmax(dim=1).cpu().tolist())
+        for (batch_features,) in loader:
+            predictions = model(batch_features.to(device))
+            predicted_digits.extend(predictions.argmax(dim=-1).cpu().flatten().tolist())
 
-    correct_digits = 0
-    correct_pins = 0
-    true_digits = labels.tolist()
-    for position in range(len(true_digits)):
-        if predicted_digits[position] == true_digits[position]:
-            correct_digits += 1
+    return score_predictions(predicted_digits, labels)
 
-    for position in range(0, len(true_digits), 4):
-        if predicted_digits[position:position + 4] == true_digits[position:position + 4]:
-            correct_pins += 1
 
-    return correct_digits, len(true_digits), correct_pins, len(rows)
+def score_predictions(predictions, labels):
+    correct = torch.as_tensor(predictions).reshape(-1, 4) == labels.reshape(-1, 4)
+    return correct.sum().item(), correct.numel(), correct.all(dim=1).sum().item(), len(correct)
 
 
 def save_model(model, model_name, mean, standard_deviation,
                train_rows, test_rows, epochs, seed):
     model_dir = PROJECT_DIR / "models"
     model_dir.mkdir(exist_ok=True)
-    filename = "keypad_" + model_name + "_mel_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".pt"
+    representation = "acoustic" if model_name == "gru" else "mel"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"keypad_{model_name}_{representation}_{timestamp}.pt"
     model_path = model_dir / filename
 
-    train_ids = []
-    for row in train_rows:
-        train_ids.append(row["trial_id"])
-
-    test_ids = []
-    for row in test_rows:
-        test_ids.append(row["trial_id"])
-
-    # Store weights on CPU so this file can also be loaded without a GPU.
-    model = model.to("cpu")
     checkpoint = {
-        "model_state": model.state_dict(),
+        "model_state": model.cpu().state_dict(),
         "model_type": model_name,
-        "spectrogram_type": "mel",
         "mean": mean,
         "standard_deviation": standard_deviation,
         "epochs": epochs,
         "seed": seed,
-        "train_ids": train_ids,
-        "test_ids": test_ids,
+        "train_ids": [row["trial_id"] for row in train_rows],
+        "test_ids": [row["trial_id"] for row in test_rows],
     }
+    if model_name == "gru":
+        checkpoint.update(feature="acoustic_summary", features=mean.shape[-1])
+    else:
+        checkpoint["spectrogram_type"] = "mel"
     torch.save(checkpoint, model_path)
     return model_path
 
@@ -172,7 +168,7 @@ def main():
     parser.add_argument("--inspect", action="store_true", help="Only show detected press times")
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--seed", type=int, default=RANDOM_SEED)
-    parser.add_argument("--model", choices=["cnn", "coatnet", "both"], default="coatnet")
+    parser.add_argument("--model", choices=["cnn", "coatnet", "both", "gru"], default="coatnet")
     args = parser.parse_args()
 
     rows = read_manifest()
@@ -191,7 +187,8 @@ def main():
     print("Training recordings:", len(train_rows))
     print("Test recordings:", len(test_rows))
 
-    print("GPU:", torch.cuda.get_device_name(0))
+    if torch.cuda.is_available():
+        print("GPU:", torch.cuda.get_device_name(0))
 
     model_names = ["cnn", "coatnet"] if args.model == "both" else [args.model]
     for model_name in model_names:
