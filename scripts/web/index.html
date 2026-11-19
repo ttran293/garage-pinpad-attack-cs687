@@ -18,11 +18,13 @@
     button:disabled { opacity: .45; cursor: default; }
     #status { min-height: 25px; margin-top: 16px; font-weight: 600; }
     audio { margin-top: 14px; width: 100%; }
+    #cue { padding: 12px; margin-top: 12px; border-radius: 8px; background: #e4ebf2; font-weight: 700; }
+    #cue.press { color: #124225; background: #d5f3df; }
     @media (max-width: 500px) { .fields { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
-  <h1>Keypad recording</h1>
+  <h1 id="heading">Keypad recording</h1>
   <p class="muted">Use a test keypad and dummy sequences. Keep the microphone and keypad in the same positions for each session.</p>
   <div class="fields">
     <label>Session ID <input id="session" required maxlength="40" pattern="[A-Za-z0-9_-]+"></label>
@@ -32,6 +34,14 @@
   <div class="card">
     <div id="progress">Loading plan...</div>
     <div id="pin" class="pin">----</div>
+    <div id="calibrationInstructions" hidden>
+      <p><strong>One press only.</strong> Wait for the green PRESS cue, press the displayed digit once,
+        then fully release it. Keep the cover open, the beep on, and the microphone fixed.
+        Do not press ENTER or any other keypad button.</p>
+      <div id="cue" role="status">READY</div>
+      <p class="muted">Each take stops automatically after 4 seconds. Listen for one complete press and release before saving.
+        If filming, include the trial number and key in view; avoid speaking during takes.</p>
+    </div>
     <div class="buttons">
       <button id="start" aria-keyshortcuts="q">Start recording (Q)</button>
       <button id="stop" aria-keyshortcuts="w" disabled>Stop (W)</button>
@@ -41,7 +51,7 @@
     <div id="status" role="status"></div>
     <audio id="playback" controls hidden></audio>
   </div>
-  <p class="muted">Press Start, wait for “Recording,” enter the four digits, then press Stop. Listen before saving. Retry discards the take.</p>
+  <p id="instructions" class="muted">Press Start, wait for “Recording,” enter the four digits, then press Stop. Listen before saving. Retry discards the take.</p>
   <p class="muted">Keyboard shortcuts: Q starts, W stops, E saves, R retries. Shortcuts are inactive while editing a field.</p>
   <script>
     const $ = id => document.getElementById(id);
@@ -49,22 +59,49 @@
     const status = message => { $('status').textContent = message; };
     let trial = null, context = null, stream = null, source = null, worklet = null;
     let chunks = [], sampleRate = 0, wavBlob = null, playbackUrl = null;
+    let dataset = 'pins', initialized = false, recording = false, connecting = false, saving = false;
+    let timers = [], takeMetadata = null;
+    const calibration = () => dataset === 'calibration';
+    const clearTimers = () => { timers.forEach(clearTimeout); timers = []; };
+    const lockFields = locked => fields.forEach(id => { $(id).disabled = locked; });
+    const cue = (message, press = false) => {
+      $('cue').textContent = message;
+      $('cue').classList.toggle('press', press);
+    };
 
     const today = new Date();
     $('session').value = [today.getFullYear(), String(today.getMonth() + 1).padStart(2, '0'),
       String(today.getDate()).padStart(2, '0')].join('-') + '-a';
-    for (const id of ['session', 'keypad']) {
-      const remembered = localStorage.getItem('keypad-' + id);
-      if (remembered) $(id).value = remembered;
-      $(id).addEventListener('change', () => localStorage.setItem('keypad-' + id, $(id).value));
-    }
+    const defaultSession = $('session').value;
+    for (const id of ['session', 'keypad']) $(id).addEventListener('change', () => {
+      const key = calibration() ? 'keypad-calibration-' + id : 'keypad-' + id;
+      localStorage.setItem(key, $(id).value);
+    });
 
     async function refresh() {
       const response = await fetch('/api/state');
+      if (!response.ok) throw new Error('Could not read recording state');
       const state = await response.json();
+      dataset = state.dataset || 'pins';
+      if (!initialized) {
+        initialized = true;
+        if (calibration()) $('session').value = defaultSession.replace(/-a$/, '-cal-a');
+        for (const id of ['session', 'keypad']) {
+          const key = calibration() ? 'keypad-calibration-' + id : 'keypad-' + id;
+          const remembered = localStorage.getItem(key);
+          if (remembered) $(id).value = remembered;
+        }
+        $('heading').textContent = calibration() ? 'Single-key calibration' : 'Keypad recording';
+        document.title = $('heading').textContent;
+        $('calibrationInstructions').hidden = !calibration();
+        if (calibration()) $('instructions').textContent =
+          'Q starts a take. Wait one second for PRESS, press and release the displayed key once, then keep still. ' +
+          'The take stops after 4 seconds. E saves; R retries the same trial. You can pause between blocks and resume later.';
+      }
       trial = state.next;
-      $('progress').textContent = `${state.completed} of ${state.total} recordings saved` + (trial ? ` · ${trial.trial_id}` : ' · plan complete');
-      $('pin').textContent = trial ? trial.pin : 'Done';
+      $('progress').textContent = `${state.completed} of ${state.total} recordings saved` +
+        (trial ? ` · ${trial.trial_id}` + (calibration() ? ` · block ${trial.block}/${state.total / 10}` : '') : ' · plan complete');
+      $('pin').textContent = trial ? (calibration() ? trial.digit : trial.pin) : 'Done';
       $('start').disabled = !trial;
       if (!trial) status('All planned recordings are saved.');
     }
@@ -93,6 +130,7 @@
     }
 
     function discard() {
+      clearTimers(); takeMetadata = null; lockFields(false); cue('READY');
       wavBlob = null; chunks = [];
       if (playbackUrl) URL.revokeObjectURL(playbackUrl);
       playbackUrl = null; $('playback').hidden = true; $('playback').removeAttribute('src');
@@ -100,8 +138,11 @@
     }
 
     $('start').onclick = async () => {
-      if (!trial || !validFields()) return;
+      if (!trial || recording || connecting || saving || !validFields()) return;
       discard(); $('start').disabled = true; status('Connecting microphone...');
+      connecting = true; lockFields(true);
+      takeMetadata = { trial_id: trial.trial_id, label: calibration() ? trial.digit : trial.pin,
+        dataset, session: $('session').value, keypad: $('keypad').value, distance: $('distance').value };
       try {
         stream = await navigator.mediaDevices.getUserMedia({ audio: {
           channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false
@@ -114,19 +155,35 @@
         source = context.createMediaStreamSource(stream);
         source.connect(worklet); worklet.connect(context.destination);
         await context.resume();
-        $('stop').disabled = false; status('Recording — enter ' + trial.pin + ' now.');
+        connecting = false; recording = true;
+        if (calibration()) {
+          $('stop').disabled = true;
+          cue('WAIT'); status('Recording — keep still. Wait for the green PRESS cue.');
+          timers.push(setTimeout(() => {
+            cue('PRESS ' + takeMetadata.label + ' ONCE', true);
+            status('Press ' + takeMetadata.label + ' once, then fully release.');
+          }, 1000));
+          timers.push(setTimeout(() => { cue('RELEASE — KEEP STILL'); }, 2500));
+          timers.push(setTimeout(() => { $('stop').disabled = false; }, 3200));
+          timers.push(setTimeout(() => { if (recording) $('stop').click(); }, 4000));
+        } else {
+          $('stop').disabled = false; status('Recording — enter ' + takeMetadata.label + ' now.');
+        }
       } catch (error) {
         if (stream) stream.getTracks().forEach(track => track.stop());
         if (context) await context.close();
-        stream = null; context = null; $('start').disabled = false;
+        stream = null; context = null; connecting = false; recording = false;
+        clearTimers(); takeMetadata = null; lockFields(false); cue('READY'); $('start').disabled = !trial;
         const blocked = error.name === 'NotAllowedError' || /permission denied/i.test(error.message);
         status(blocked
-          ? 'Microphone access was blocked. Open http://localhost:8765/ directly in Chrome or Edge and allow microphone access for this site. If it still fails, check Windows Settings > Privacy & security > Microphone, then enable Microphone access and Let desktop apps access your microphone.'
+          ? 'Microphone access was blocked. Open ' + location.origin + '/ directly in Chrome or Edge and allow microphone access for this site. If it still fails, check Windows Settings > Privacy & security > Microphone, then enable Microphone access and Let desktop apps access your microphone.'
           : 'Microphone error: ' + error.message);
       }
     };
 
     $('stop').onclick = async () => {
+      if (!recording) return;
+      recording = false; clearTimers();
       $('stop').disabled = true;
       source.disconnect(); worklet.disconnect();
       stream.getTracks().forEach(track => track.stop());
@@ -136,25 +193,40 @@
       playbackUrl = URL.createObjectURL(wavBlob);
       $('playback').src = playbackUrl; $('playback').hidden = false;
       $('save').disabled = false; $('retry').disabled = false;
-      status('Take ready — play it, then Save or Retry.');
+      cue('REVIEW TAKE');
+      status(calibration() ? 'Take ready — check for ONE press and full release, then Save or Retry.'
+        : 'Take ready — play it, then Save or Retry.');
     };
 
-    $('retry').onclick = () => { discard(); status('Take discarded. Ready to record the same PIN.'); };
+    $('retry').onclick = () => {
+      if (recording || connecting || saving) return;
+      discard(); status('Take discarded. Ready to record the same ' + (calibration() ? 'key.' : 'PIN.'));
+    };
 
     $('save').onclick = async () => {
-      if (!wavBlob || !validFields()) return;
-      $('save').disabled = true; status('Saving...');
-      const headers = { 'Content-Type': 'audio/wav', 'X-Trial-Id': trial.trial_id,
-        'X-Session-Id': $('session').value, 'X-Keypad-Id': $('keypad').value,
-        'X-Distance-Cm': $('distance').value };
+      if (!wavBlob || !takeMetadata || saving) return;
+      saving = true; $('save').disabled = true; $('retry').disabled = true; status('Saving...');
+      const headers = { 'Content-Type': 'audio/wav', 'X-Trial-Id': takeMetadata.trial_id,
+        'X-Session-Id': takeMetadata.session, 'X-Keypad-Id': takeMetadata.keypad,
+        'X-Distance-Cm': takeMetadata.distance, 'X-Dataset': takeMetadata.dataset,
+        'X-Expected-Label': takeMetadata.label };
+      let persisted = false;
       try {
         const response = await fetch('/api/record', { method: 'POST', headers, body: wavBlob });
         const result = await response.json();
         if (!response.ok) throw new Error(result.error || 'Save failed');
+        persisted = true;
         discard(); await refresh();
-        if (trial) status('Saved. Ready for the next PIN.');
+        if (trial) status('Saved. Ready for the next ' + (calibration() ? 'key.' : 'PIN.'));
       } catch (error) {
-        $('save').disabled = false; status('Save failed: ' + error.message);
+        if (persisted) {
+          $('start').disabled = true; $('save').disabled = true; $('retry').disabled = true;
+          status('Take saved. Reload this page to load the next trial: ' + error.message);
+        } else {
+          $('save').disabled = false; $('retry').disabled = false; status('Save failed: ' + error.message);
+        }
+      } finally {
+        saving = false;
       }
     };
 

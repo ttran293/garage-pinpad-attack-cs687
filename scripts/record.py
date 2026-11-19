@@ -18,14 +18,28 @@ from urllib.parse import urlparse
 
 
 ROOT = Path(__file__).resolve().parent
+DATASET = "pins"
 DATA = ROOT / "data"
 PLAN = DATA / "plan.csv"
 MANIFEST = DATA / "manifest.csv"
 AUDIO = DATA / "audio"
 WEB = ROOT / "web"
-FIELDS = ["trial_id", "pin", "audio_path", "session_id", "keypad_id",
+PIN_FIELDS = ["trial_id", "pin", "audio_path", "session_id", "keypad_id",
           "distance_cm", "recorded_at_utc", "sample_rate", "duration_s", "peak", "clipped_pct"]
+CALIBRATION_FIELDS = ["trial_id", "digit", "block", "repeat", *PIN_FIELDS[2:]]
+FIELDS = PIN_FIELDS
 LOCK = threading.Lock()
+
+
+def configure_dataset(name: str) -> None:
+    """Select a dataset once at startup; PIN training paths remain unchanged."""
+    global DATASET, DATA, PLAN, MANIFEST, AUDIO, FIELDS
+    if name not in ("pins", "calibration"):
+        raise ValueError("Dataset must be pins or calibration")
+    DATASET = name
+    DATA = ROOT / ("calibration" if name == "calibration" else "data")
+    PLAN, MANIFEST, AUDIO = DATA / "plan.csv", DATA / "manifest.csv", DATA / "audio"
+    FIELDS = CALIBRATION_FIELDS if name == "calibration" else PIN_FIELDS
 
 
 def read_csv(path: Path) -> list[dict[str, str]]:
@@ -54,19 +68,38 @@ def make_plan(count: int, seed: int) -> list[dict[str, str]]:
     raise ValueError("Could not generate unique PINs; try a smaller count or another seed")
 
 
+def make_calibration_plan(count: int = 200, seed: int = 687) -> list[dict[str, str]]:
+    """One of each digit per randomized block; twenty examples/digit by default."""
+    if count < 10 or count % 10:
+        raise ValueError("Calibration count must be a positive multiple of 10")
+    rng = random.Random(seed)
+    rows = []
+    for block in range(1, count // 10 + 1):
+        digits = list("0123456789")
+        rng.shuffle(digits)
+        if rows and digits[0] == rows[-1]["digit"]:
+            digits[0], digits[1] = digits[1], digits[0]
+        for digit in digits:
+            rows.append({"trial_id": f"C{len(rows) + 1:04d}", "digit": digit,
+                         "block": str(block), "repeat": str(block)})
+    return rows
+
+
 def init(count: int, seed: int) -> None:
     DATA.mkdir(exist_ok=True)
     AUDIO.mkdir(exist_ok=True)
     if PLAN.exists() or MANIFEST.exists():
         raise FileExistsError("Dataset already initialized; existing recordings were preserved")
-    rows = make_plan(count, seed)
+    calibration = DATASET == "calibration"
+    rows = make_calibration_plan(count, seed) if calibration else make_plan(count, seed)
     with PLAN.open("w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=["trial_id", "pin"])
+        writer = csv.DictWriter(file, fieldnames=["trial_id", "digit", "block", "repeat"]
+                                if calibration else ["trial_id", "pin"])
         writer.writeheader()
         writer.writerows(rows)
     with MANIFEST.open("w", newline="", encoding="utf-8") as file:
         csv.DictWriter(file, fieldnames=FIELDS).writeheader()
-    print(f"Created {count} balanced four-digit trials in {PLAN}")
+    print(f"Created {count} {'single-key calibration' if calibration else 'four-digit'} trials in {PLAN}")
 
 
 def audio_stats(blob: bytes) -> tuple[int, float, float, float]:
@@ -98,6 +131,9 @@ def safe_id(value: str, name: str) -> str:
 
 
 def save_recording(blob: bytes, headers) -> dict:
+    calibration = DATASET == "calibration"
+    if headers.get("X-Dataset", "pins") != DATASET:
+        raise ValueError("Wrong dataset; reload the recording page for this server")
     trial_id = safe_id(headers.get("X-Trial-Id", ""), "Trial ID")
     session_id = safe_id(headers.get("X-Session-Id", ""), "Session ID")
     keypad_id = safe_id(headers.get("X-Keypad-Id", ""), "Keypad ID")
@@ -105,10 +141,15 @@ def save_recording(blob: bytes, headers) -> dict:
     if not re.fullmatch(r"\d{1,3}", distance) or not 1 <= int(distance) <= 999:
         raise ValueError("Distance must be 1-999 cm")
     rate, duration, peak, clipped = audio_stats(blob)
+    if calibration and duration < 3:
+        raise ValueError("Calibration takes need at least 3 seconds to retain press and release audio")
     with LOCK:
-        plan = {row["trial_id"]: row["pin"] for row in read_csv(PLAN)}
+        plan = {row["trial_id"]: row for row in read_csv(PLAN)}
         if trial_id not in plan:
             raise ValueError("Unknown trial ID")
+        planned = plan[trial_id]
+        if calibration and headers.get("X-Expected-Label", "") != planned["digit"]:
+            raise ValueError("Displayed digit does not match this trial; reload the page")
         if trial_id in {row["trial_id"] for row in read_csv(MANIFEST)}:
             raise ValueError("This trial was already saved")
         AUDIO.mkdir(exist_ok=True)
@@ -118,12 +159,16 @@ def save_recording(blob: bytes, headers) -> dict:
             raise ValueError("Audio file already exists")
         path.write_bytes(blob)
         row = {
-            "trial_id": trial_id, "pin": plan[trial_id], "audio_path": relative,
+            "trial_id": trial_id, "audio_path": relative,
             "session_id": session_id, "keypad_id": keypad_id, "distance_cm": distance,
             "recorded_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "sample_rate": str(rate), "duration_s": f"{duration:.3f}",
             "peak": f"{peak:.4f}", "clipped_pct": f"{clipped:.3f}",
         }
+        if calibration:
+            row.update(digit=planned["digit"], block=planned["block"], repeat=planned["repeat"])
+        else:
+            row["pin"] = planned["pin"]
         try:
             with MANIFEST.open("a", newline="", encoding="utf-8") as file:
                 writer = csv.DictWriter(file, fieldnames=FIELDS)
@@ -159,7 +204,8 @@ class Handler(BaseHTTPRequestHandler):
             plan = read_csv(PLAN)
             done = {row["trial_id"] for row in read_csv(MANIFEST)}
             pending = next((row for row in plan if row["trial_id"] not in done), None)
-            self.send_json(200, {"total": len(plan), "completed": len(done), "next": pending})
+            self.send_json(200, {"dataset": DATASET, "total": len(plan),
+                                 "completed": len(done), "next": pending})
             return
         files = {"/": (WEB / "index.html", "text/html; charset=utf-8"),
                  "/recorder-worklet.js": (WEB / "recorder-worklet.js", "text/javascript; charset=utf-8")}
@@ -194,10 +240,17 @@ def audit() -> None:
     if not plan:
         raise ValueError("Run 'init' first")
     print(f"Saved: {len(records)}/{len(plan)}")
-    for position in range(4):
-        counts = {str(d): sum(row["pin"][position] == str(d) for row in records)
-                  for d in range(10)}
-        print(f"Position {position + 1}: {counts}")
+    if DATASET == "calibration":
+        print("Single-key counts:", {str(d): sum(row["digit"] == str(d) for row in records)
+                                     for d in range(10)})
+        print("Completed blocks:", sum(all(row["trial_id"] in {r["trial_id"] for r in records}
+                                          for row in plan if row["block"] == block)
+                                      for block in {row["block"] for row in plan}))
+    else:
+        for position in range(4):
+            counts = {str(d): sum(row["pin"][position] == str(d) for row in records)
+                      for d in range(10)}
+            print(f"Position {position + 1}: {counts}")
     print("Sessions:", {session: sum(row["session_id"] == session for row in records)
                          for session in sorted({row["session_id"] for row in records})})
     issues = []
@@ -216,21 +269,26 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     initialize = sub.add_parser("init", help="Create a balanced recording plan")
-    initialize.add_argument("--count", type=int, default=50)
+    initialize.add_argument("--count", type=int, help="Trials: default 50 PINs or 200 calibration presses")
     initialize.add_argument("--seed", type=int, default=687)
     serve = sub.add_parser("serve", help="Start the local recording app")
-    serve.add_argument("--port", type=int, default=8765)
-    sub.add_parser("audit", help="Summarize saved recordings")
+    serve.add_argument("--port", type=int, help="Default 8765 for PINs, 8766 for calibration")
+    audit_parser = sub.add_parser("audit", help="Summarize saved recordings")
+    for command in (initialize, serve, audit_parser):
+        command.add_argument("--dataset", choices=["pins", "calibration"], default="pins")
     args = parser.parse_args()
+    configure_dataset(args.dataset)
     if args.command == "init":
-        init(args.count, args.seed)
+        count = args.count if args.count is not None else (200 if DATASET == "calibration" else 50)
+        init(count, args.seed)
     elif args.command == "audit":
         audit()
     else:
         if not PLAN.exists():
             parser.error("Run 'init' before 'serve'")
-        server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-        print(f"Open http://localhost:{args.port}/ and press Ctrl+C to stop")
+        port = args.port if args.port is not None else (8766 if DATASET == "calibration" else 8765)
+        server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+        print(f"Dataset: {DATASET}; open http://localhost:{port}/ and press Ctrl+C to stop")
         try:
             server.serve_forever()
         except KeyboardInterrupt:
